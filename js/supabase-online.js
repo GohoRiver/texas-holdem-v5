@@ -24,8 +24,8 @@ window.PokerOnline = (function(){
   let lobbyRooms = {};
   let hostRoomInfo = null;
   let hostAnnounceTimer = null;
-  const ROOM_TTL_MS = 8000;      // 房间心跳超时（缩短到 8s）
-  const ANNOUNCE_MS = 2000;      // 房主心跳间隔（缩短到 2s）
+  const ROOM_TTL_MS = 8000;
+  const ANNOUNCE_MS = 2000;
 
   function init(){
     if(!window.supabase){
@@ -140,7 +140,6 @@ window.PokerOnline = (function(){
         };
         broadcastPlayerList();
         notifyPlayers();
-        // 有人进房，房间数变了，立刻广播一次
         announceRoom();
       } else {
         broadcastPlayerList();
@@ -163,7 +162,7 @@ window.PokerOnline = (function(){
         delete roomPlayers[p.peerId];
         broadcastPlayerList();
         notifyPlayers();
-        announceRoom(); // 人数变了，同步
+        announceRoom();
       }
     });
 
@@ -193,7 +192,6 @@ window.PokerOnline = (function(){
           broadcastPlayerList();
           notifyPlayers();
 
-          // 立即广播一次 + 每 2 秒心跳
           announceRoom();
           if(hostAnnounceTimer) clearInterval(hostAnnounceTimer);
           hostAnnounceTimer = setInterval(announceRoom, ANNOUNCE_MS);
@@ -206,6 +204,7 @@ window.PokerOnline = (function(){
   }
 
   /* ====== 加入房间（客户端）====== */
+  /* ★ 关键改动：心跳从 1.5s 全量同步 → 12s 低频保活；不再 5 次连发 player_join */
   function joinRoom(roomId){
     isHost = false;
     currentRoomId = roomId;
@@ -247,15 +246,17 @@ window.PokerOnline = (function(){
     return new Promise(function(resolve){
       channel.subscribe(function(status){
         if(status === 'SUBSCRIBED'){
-          for(let i = 0; i < 5; i++){
+          // 只发 3 次 player_join（覆盖短暂网络抖动即可），不要连发 5 次
+          for(let i = 0; i < 3; i++){
             setTimeout(function(){
               send('player_join', { peerId: myId, name: nickname });
             }, i * 300);
           }
+          // 12s 保活，只是兜底；房主会在行动/进街/摊牌时主动广播
           heartbeatTimer = setInterval(function(){
             if(!channel) return;
             send('sync_request', { peerId: myId });
-          }, 1500);
+          }, 12000);
           console.log('[Supabase] joined room:', roomId);
           resolve();
         }
