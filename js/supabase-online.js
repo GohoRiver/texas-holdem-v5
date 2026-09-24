@@ -19,12 +19,13 @@ window.PokerOnline = (function(){
   let onRoomsUpdate = null;
   let heartbeatTimer = null;
 
-  /* ===== 新增：大厅房间发现（不影响主流程） ===== */
+  /* ===== 大厅房间发现 ===== */
   let lobbyChannel = null;
   let lobbyRooms = {};
   let hostRoomInfo = null;
   let hostAnnounceTimer = null;
-  const ROOM_TTL_MS = 15000;
+  const ROOM_TTL_MS = 8000;      // 房间心跳超时（缩短到 8s）
+  const ANNOUNCE_MS = 2000;      // 房主心跳间隔（缩短到 2s）
 
   function init(){
     if(!window.supabase){
@@ -35,7 +36,6 @@ window.PokerOnline = (function(){
     nickname = PokerStorage.getNickname() || 'Player';
     console.log('[Supabase] initialized, myId:', myId);
 
-    // 单独 try，失败也不阻塞主流程
     try { initLobbyChannel(); }
     catch(e){ console.warn('[Supabase] lobby channel init failed', e); }
 
@@ -46,7 +46,7 @@ window.PokerOnline = (function(){
   function setPlayersCallback(cb){ onPlayersUpdate = cb; }
   function setRoomsCallback(cb){ onRoomsUpdate = cb; }
 
-  /* ===== 大厅频道：负责房间发现 ===== */
+  /* ===== 大厅频道 ===== */
   function initLobbyChannel(){
     if(lobbyChannel) return;
     lobbyChannel = supabase.channel('lobby', {
@@ -118,7 +118,7 @@ window.PokerOnline = (function(){
     if(hostAnnounceTimer){ clearInterval(hostAnnounceTimer); hostAnnounceTimer = null; }
   }
 
-  /* ====== 创建房间（房主） —— 逻辑跟原版完全一致，只在结尾加了大厅广播 ====== */
+  /* ====== 创建房间（房主）====== */
   function createRoom(roomId, info){
     isHost = true;
     currentRoomId = roomId;
@@ -140,6 +140,8 @@ window.PokerOnline = (function(){
         };
         broadcastPlayerList();
         notifyPlayers();
+        // 有人进房，房间数变了，立刻广播一次
+        announceRoom();
       } else {
         broadcastPlayerList();
       }
@@ -161,6 +163,7 @@ window.PokerOnline = (function(){
         delete roomPlayers[p.peerId];
         broadcastPlayerList();
         notifyPlayers();
+        announceRoom(); // 人数变了，同步
       }
     });
 
@@ -174,7 +177,6 @@ window.PokerOnline = (function(){
       if(onMessage) onMessage({ type: 'player_action', ...payload.payload });
     });
 
-    // 记录本房间信息，用于向大厅广播
     hostRoomInfo = {
       roomId: roomId,
       level: info.level || 'nano',
@@ -191,10 +193,10 @@ window.PokerOnline = (function(){
           broadcastPlayerList();
           notifyPlayers();
 
-          // 立即广播一次，之后每 4 秒心跳
+          // 立即广播一次 + 每 2 秒心跳
           announceRoom();
           if(hostAnnounceTimer) clearInterval(hostAnnounceTimer);
-          hostAnnounceTimer = setInterval(announceRoom, 4000);
+          hostAnnounceTimer = setInterval(announceRoom, ANNOUNCE_MS);
 
           console.log('[Supabase] room created:', roomId);
           resolve();
@@ -203,7 +205,7 @@ window.PokerOnline = (function(){
     });
   }
 
-  /* ====== 加入房间（客户端） —— 逻辑跟原版完全一致 ====== */
+  /* ====== 加入房间（客户端）====== */
   function joinRoom(roomId){
     isHost = false;
     currentRoomId = roomId;
@@ -316,7 +318,7 @@ window.PokerOnline = (function(){
 
   function leaveRoom(){
     if(heartbeatTimer){ clearInterval(heartbeatTimer); heartbeatTimer = null; }
-    if(isHost) stopAnnounce();  // 只有房主需要向大厅宣布关闭
+    if(isHost) stopAnnounce();
     if(channel){
       send('leave', { peerId: myId });
       supabase.removeChannel(channel);
