@@ -13,22 +13,18 @@ const G = {
   raiseMin: 0, raiseMax: 0, seatPositions: [],
   _renderedCards: new WeakSet(), turnTimer: null, turnTimeLeft: 30,
   online: {
-    active: false,
-    isHost: false,
-    roomId: '',
-    mySeat: 0,
-    started: false,
-    broadcastTimer: null
+    active: false, isHost: false, roomId: '',
+    mySeat: 0, started: false, broadcastTimer: null
   },
-  /* 缓存签名 */
-  _lastStateSig: '',
-  _lastActionSig: '',
-  _lastBoardSig: '',
-  _lastHandSig: '',
+  _lastStateSig: '', _lastActionSig: '', _lastBoardSig: '', _lastHandSig: '',
   _timerKey: null,
-  /* ★ 新增：下一手 / 房主超时定时器 */
+  /* ★ 新增：倒计时时间戳 */
   _hostTimeout: null,
-  _nextHandTimer: null
+  _nextHandTimer: null,
+  _nextHandEndsAt: 0,
+  _turnEndsAt: 0,
+  _nextHandToastTimer: null,
+  _turnTickTimer: null
 };
 
 const STAGE_KEYS = {
@@ -47,55 +43,39 @@ const LEVELS = [
 const ONLINE_MAX_SEATS = 7;
 const ONLINE_MIN_SEATS = 2;
 const CHIP_TO_BEM = 0.0001;
-const NEXT_HAND_DELAY = 8;   // ★ 自动下一手秒数
+const NEXT_HAND_DELAY = 8;      // ★ 秒
 
-/* ===== 牌对象缓存（消除频闪） ===== */
+/* ===== 牌对象缓存（消频闪） ===== */
 const _cardCache = new Map();
 function normalizeCard(c){
   if(!c || !c.rank || !c.suit) return c;
   const key = c.suit + c.rank;
   let card = _cardCache.get(key);
   if(card) return card;
-  card = {
-    rank: c.rank, suit: c.suit, value: c.value,
-    display: c.display || (c.rank + ' ' + c.suit),
-    red: !!c.red
-  };
+  card = { rank:c.rank, suit:c.suit, value:c.value, display:c.display || (c.rank+' '+c.suit), red:!!c.red };
   _cardCache.set(key, card);
   return card;
 }
-function normalizeCards(arr){
-  if(!arr || !arr.length) return [];
-  return arr.map(normalizeCard);
-}
+function normalizeCards(arr){ return arr && arr.length ? arr.map(normalizeCard) : []; }
 
-/* ===== 状态指纹辅助 ===== */
-function cardKey(c){ if(!c) return ''; return String(c.suit || '') + String(c.rank || ''); }
-function cardsSig(arr){
-  if(!arr || !arr.length) return '';
-  return arr.map(cardKey).join(',');
-}
+/* ===== 状态指纹 ===== */
+function cardKey(c){ return c ? String(c.suit||'')+String(c.rank||'') : ''; }
+function cardsSig(arr){ return arr && arr.length ? arr.map(cardKey).join(',') : ''; }
 function buildStateSig(state){
   if(!state) return '';
   const players = (state.players || []).map(function(p){
     return [
-      p.peerId || p.id,
-      p.chips,
-      p.folded ? 1 : 0,
-      p.allIn ? 1 : 0,
-      p.currentBet || 0,
-      p.lastAction || '',
-      p.position || '',
-      p.revealCards ? 1 : 0,
-      cardsSig(p.holeCards)
+      p.peerId || p.id, p.chips, p.folded?1:0, p.allIn?1:0,
+      p.seated === false ? 0 : 1,
+      p.currentBet||0, p.lastAction||'', p.position||'',
+      p.revealCards?1:0, cardsSig(p.holeCards)
     ].join(':');
   }).join('|');
   return [
     state.handNumber, state.stage, state.currentPlayerIndex,
     state.pot, state.currentBet, state.dealerIndex,
-    state.gameOver ? 1 : 0,
-    cardsSig(state.community),
-    players
+    state.gameOver?1:0, state.phase || '', state.nextHandEndsAt || 0,
+    cardsSig(state.community), players
   ].join('/');
 }
 function buildActionSig(){
@@ -104,7 +84,7 @@ function buildActionSig(){
   const toCall = Math.max(0, G.currentBet - (me.currentBet || 0));
   return [
     G.handNumber, G.stage, G.currentPlayerIndex, myIndex(),
-    me.folded ? 1 : 0, me.allIn ? 1 : 0, me.chips, toCall, G.currentBet
+    me.folded?1:0, me.allIn?1:0, me.chips, toCall, G.currentBet
   ].join(':');
 }
 
@@ -224,12 +204,13 @@ function renderNumbers(){
   });
 }
 
-/* ========== 会话生命周期（★ 新增） ========== */
+/* ========== 会话生命周期 ========== */
 function resetSessionState(){
-  /* 清掉定时器 */
   if(G.turnTimer){ clearInterval(G.turnTimer); G.turnTimer = null; }
   if(G._hostTimeout){ clearTimeout(G._hostTimeout); G._hostTimeout = null; }
   if(G._nextHandTimer){ clearInterval(G._nextHandTimer); G._nextHandTimer = null; }
+  if(G._nextHandToastTimer){ clearInterval(G._nextHandToastTimer); G._nextHandToastTimer = null; }
+  if(G._turnTickTimer){ clearInterval(G._turnTickTimer); G._turnTickTimer = null; }
   if(G.online.broadcastTimer){ clearInterval(G.online.broadcastTimer); G.online.broadcastTimer = null; }
 
   G.players = [];
@@ -256,26 +237,29 @@ function resetSessionState(){
   G._lastBoardSig = '';
   G._lastHandSig = '';
   G._timerKey = null;
+  G._nextHandEndsAt = 0;
+  G._turnEndsAt = 0;
 }
 
 function resetTableDom(){
-  const ids = ['seatsLayer','boardCards','handCardsLarge','logArea','humanActions'];
-  ids.forEach(function(id){
-    const el = document.getElementById(id);
-    if(el) el.innerHTML = '';
+  ['seatsLayer','boardCards','handCardsLarge','logArea','humanActions'].forEach(function(id){
+    const el = document.getElementById(id); if(el) el.innerHTML = '';
   });
   const pot = document.getElementById('potMain'); if(pot) pot.textContent = '0';
-  const potSide = document.getElementById('potSideWrap'); if(potSide) potSide.classList.add('hidden');
-  const potSideVal = document.getElementById('potSide'); if(potSideVal) potSideVal.textContent = '0';
+  const psw = document.getElementById('potSideWrap'); if(psw) psw.classList.add('hidden');
+  const ps = document.getElementById('potSide'); if(ps) ps.textContent = '0';
   const panel = document.getElementById('raisePanel'); if(panel) panel.classList.add('hidden');
   const nextBtn = document.getElementById('nextHandBtn'); if(nextBtn) nextBtn.classList.add('hidden');
   const timer = document.getElementById('turnTimer'); if(timer) timer.classList.add('hidden');
   const stage = document.getElementById('stageLabel'); if(stage) stage.textContent = '';
   const hand = document.getElementById('gameHandLabel'); if(hand) hand.textContent = '';
   const handInfo = document.getElementById('handInfo'); if(handInfo) handInfo.innerHTML = '';
+  /* 移除动态节点 */
+  const toast = document.getElementById('nextHandToast'); if(toast) toast.remove();
+  const tng = document.getElementById('turnRing'); if(tng) tng.remove();
 }
 
-/* ★ 隐藏操作栏（清按钮、关面板、停计时器） */
+/* ★ 隐藏操作栏 */
 function hideHumanActions(){
   const box = $("humanActions"); if(box) box.innerHTML = "";
   const panel = $("raisePanel"); if(panel) panel.classList.add("hidden");
@@ -283,11 +267,9 @@ function hideHumanActions(){
   if(G.turnTimer) stopTurnTimer();
 }
 
-/* ★ 无人跟注时把底池给最后没弃牌的人 */
+/* ★ 无人跟注把底池给最后没弃牌的人 */
 function awardUncontestedPot(){
-  const alive = G.players.filter(function(p){
-    return p.seated !== false && !p.folded;
-  });
+  const alive = G.players.filter(function(p){ return p.seated !== false && !p.folded; });
   const pot = G.pot;
   if(alive.length === 1 && pot > 0){
     const w = alive[0];
@@ -300,49 +282,200 @@ function awardUncontestedPot(){
   G.busy = false;
 }
 
-/* ★ 结算完一手后，8 秒倒计时自动下一手 */
-function scheduleNextHand(startFn){
+/* ============ 等待栏（准备室） ============ */
+function ensureWaitingBar(){
+  let bar = document.getElementById('waitingBar');
+  if(bar) return bar;
+  bar = document.createElement('div');
+  bar.id = 'waitingBar';
+  bar.className = 'waiting-bar hidden';
+  const tableArea = document.querySelector('.table-area');
+  if(tableArea) tableArea.appendChild(bar);
+  return bar;
+}
+
+function showWaitingBar(){
+  const bar = ensureWaitingBar();
+  if(!bar) return;
+  const code = (window.PokerOnline && PokerOnline.getRoomId) ? PokerOnline.getRoomId() : '';
+  bar.innerHTML =
+    '<div class="waiting-room">' + (isEn() ? 'Room ' : '房间号 ') + '<b>' + (code || '—') + '</b></div>' +
+    '<div class="waiting-info" id="waitingInfo">0 / 7</div>' +
+    '<button class="mini-btn" id="waitingReadyBtn" type="button">' + (isEn() ? 'Ready' : '准备好了') + '</button>' +
+    '<button class="mini-btn ghost" id="waitingLeaveBtn" type="button">' + (isEn() ? 'Leave' : '离桌') + '</button>';
+  bar.classList.remove('hidden');
+
+  const readyBtn = document.getElementById('waitingReadyBtn');
+  if(readyBtn){
+    /* 根据当前 ready 状态初始化文案 */
+    const me = (window.PokerOnline && PokerOnline.getRoomPlayers) ? PokerOnline.getRoomPlayers()[PokerOnline.getMyId()] : null;
+    if(me && me.ready) readyBtn.textContent = isEn() ? 'Cancel ready' : '取消准备';
+    readyBtn.onclick = function(){
+      const isReady = PokerOnline.toggleReady();
+      readyBtn.textContent = isReady ? (isEn() ? 'Cancel ready' : '取消准备') : (isEn() ? 'Ready' : '准备好了');
+      updateWaitingBar();
+    };
+  }
+  const leaveBtn = document.getElementById('waitingLeaveBtn');
+  if(leaveBtn) leaveBtn.onclick = function(){ backToLobby(); };
+  updateWaitingBar();
+}
+
+function updateWaitingBar(){
+  const info = document.getElementById('waitingInfo');
+  if(!info) return;
+  const players = (window.PokerOnline && PokerOnline.getRoomPlayers) ? PokerOnline.getRoomPlayers() : {};
+  const ids = Object.keys(players);
+  const ready = ids.filter(function(id){ return players[id].ready; }).length;
+  info.textContent = ids.length + ' / ' + ONLINE_MAX_SEATS + ' · ' + ready + (isEn() ? ' ready' : ' 已准备');
+}
+
+function hideWaitingBar(){
+  const bar = document.getElementById('waitingBar');
+  if(bar) bar.classList.add('hidden');
+}
+
+/* ★ 从 roomPlayers 同步等待界面的座位 */
+function syncWaitingSeatsFromRoom(){
+  if(!G.online.active) return;
+  if(G.online.started && G.stage !== 'waiting') return;
+
+  const players = (window.PokerOnline && PokerOnline.getRoomPlayers) ? PokerOnline.getRoomPlayers() : {};
+  const myId = window.PokerOnline ? PokerOnline.getMyId() : null;
+  const ids = Object.keys(players);
+  ids.sort(function(a, b){
+    return (players[a].seat || 0) - (players[b].seat || 0);
+  });
+
+  const existing = {};
+  G.players.forEach(function(p){ if(p.peerId) existing[p.peerId] = p; });
+
+  G.players = ids.map(function(pid){
+    const info = players[pid];
+    const isSelf = pid === myId;
+    const old = existing[pid];
+    if(old){
+      old.id = info.seat;
+      old.name = info.name;
+      old.isHuman = isSelf;
+      old.ready = !!info.ready;
+      old.seated = true;
+      old.holeCards = [];
+      old.folded = false;
+      old.allIn = false;
+      old.currentBet = 0;
+      old.lastAction = '';
+      old.revealCards = false;
+      old._highlight = null;
+      return old;
+    }
+    return {
+      id: info.seat, peerId: pid, name: info.name,
+      emoji: isSelf ? PokerAvatars.HUMAN.emoji : '🎮',
+      bg: isSelf ? PokerAvatars.HUMAN.bg : 'linear-gradient(135deg,#a855f7,#6d28d9)',
+      isHuman: isSelf,
+      chips: 10000, seated: true,
+      holeCards: [], folded: false, allIn: false,
+      currentBet: 0, totalContributed: 0, needsToAct: false,
+      position:'', positionKey:'', lastAction:'', styleKey:null,
+      revealCards:false, _highlight:null, preflopOrder:0, postflopOrder:0,
+      ready: !!info.ready
+    };
+  });
+
+  G.online.mySeat = G.players.findIndex(function(p){ return p.peerId === myId; });
+  G.seatPositions = computeSeatPositions(ONLINE_MAX_SEATS);
+  render();
+}
+
+/* ★ 回到等待状态 */
+function returnToWaiting(){
+  if(G._nextHandTimer){ clearInterval(G._nextHandTimer); G._nextHandTimer = null; }
+  if(G._hostTimeout){ clearTimeout(G._hostTimeout); G._hostTimeout = null; }
+  if(G._nextHandToastTimer){ clearInterval(G._nextHandToastTimer); G._nextHandToastTimer = null; }
+  stopTurnTimer();
+  hideNextHandToast();
+
+  G.online.started = false;
+  G.stage = 'waiting';
+  G.pot = 0;
+  G.currentBet = 0;
+  G.community = [];
+  G.handNumber = 0;
+  G.gameOver = false;
+  G.busy = false;
+  G.dealerIndex = 0;
+  G.currentPlayerIndex = 0;
+  G._nextHandEndsAt = 0;
+  G._turnEndsAt = 0;
+
+  G.players.forEach(function(p){
+    p.holeCards = [];
+    p.folded = false;
+    p.allIn = false;
+    p.currentBet = 0;
+    p.totalContributed = 0;
+    p.lastAction = '';
+    p.revealCards = false;
+    p._highlight = null;
+    p.needsToAct = false;
+  });
+
+  syncWaitingSeatsFromRoom();
+  showWaitingBar();
+  hideHumanActions();
+
+  const bc = document.getElementById('boardCards'); if(bc) bc.innerHTML = '';
+  const pm = document.getElementById('potMain'); if(pm) pm.textContent = '0';
+  const handArea = document.getElementById('handCardsLarge'); if(handArea) handArea.innerHTML = '';
+
+  render();
+  if(G.online.active && G.online.isHost) broadcastFullState();
+}
+
+/* ★ 8 秒下一手：房主起跳，客户端同步可见 */
+function beginNextHandCountdown(startFn){
   if(G._nextHandTimer){ clearInterval(G._nextHandTimer); G._nextHandTimer = null; }
 
-  /* 检查是否还有 ≥2 个在座玩家 */
-  const alive = G.players.filter(function(p){
-    return p.seated !== false && p.chips > 0;
-  });
-  if(alive.length < 2){
-    const btn = $("nextHandBtn");
-    if(btn) btn.classList.add("hidden");
+  const seated = G.players.filter(function(p){ return p.seated !== false; });
+  if(seated.length < 2){
     if(G.online.active && G.online.isHost){
       log(isEn() ? "Not enough players — waiting" : "人数不足，等待更多玩家", "hl");
-      broadcastFullState();
     }
+    returnToWaiting();
     return;
   }
 
+  const duration = NEXT_HAND_DELAY * 1000;
+  G._nextHandEndsAt = Date.now() + duration;
+  showNextHandToast(G._nextHandEndsAt);
+  if(G.online.active && G.online.isHost) broadcastFullState();
+
+  /* 房主端也显示按钮，允许提前点击 */
   const btn = $("nextHandBtn");
-  let left = NEXT_HAND_DELAY;
-  const tick = function(){
-    if(btn) btn.textContent = "▶ " + (isEn() ? "Next hand (" + left + "s)" : "下一手（" + left + "s）");
-  };
-  if(btn){ btn.classList.remove("hidden"); btn.disabled = false; tick(); }
+  if(btn){
+    btn.classList.remove('hidden');
+    btn.disabled = false;
+    btn.onclick = fire;
+  }
 
-  const fire = function(){
+  function fire(){
     if(G._nextHandTimer){ clearInterval(G._nextHandTimer); G._nextHandTimer = null; }
-    if(btn) btn.classList.add("hidden");
-    /* 二次检查（点击和倒计时可能同时触发） */
-    const still = G.players.filter(function(p){
-      return p.seated !== false && p.chips > 0;
-    });
-    if(still.length < 2) return;
+    G._nextHandEndsAt = 0;
+    if(btn) btn.classList.add('hidden');
+    hideNextHandToast();
+    const still = G.players.filter(function(p){ return p.seated !== false && p.chips > 0; });
+    if(still.length < 2){ returnToWaiting(); return; }
     rotateDealerAndStart(startFn);
-  };
+  }
 
-  if(btn) btn.onclick = fire;
-
-  G._nextHandTimer = setInterval(function(){
-    left--;
-    if(left <= 0){ fire(); return; }
-    tick();
-  }, 1000);
+  function tick(){
+    const left = Math.max(0, Math.ceil((G._nextHandEndsAt - Date.now()) / 1000));
+    if(btn) btn.textContent = '▶ ' + (isEn() ? ('Next (' + left + 's)') : ('下一手（' + left + 's）'));
+    if(left <= 0){ fire(); }
+  }
+  tick();
+  G._nextHandTimer = setInterval(tick, 500);
 }
 
 function rotateDealerAndStart(startFn){
@@ -358,30 +491,76 @@ function rotateDealerAndStart(startFn){
   startFn();
 }
 
-/* ★ 房主处理客人离桌 */
+/* ★ 桌面中央「下一手 8」toast */
+function showNextHandToast(endsAt){
+  let toast = document.getElementById('nextHandToast');
+  if(!toast){
+    toast = document.createElement('div');
+    toast.id = 'nextHandToast';
+    toast.className = 'next-hand-toast';
+    const center = document.querySelector('.table-center');
+    if(center) center.appendChild(toast);
+    else document.body.appendChild(toast);
+  }
+  toast.classList.remove('hidden');
+  if(G._nextHandToastTimer){ clearInterval(G._nextHandToastTimer); }
+  const update = function(){
+    const left = Math.max(0, Math.ceil((endsAt - Date.now()) / 1000));
+    toast.textContent = (isEn() ? 'Next hand ' : '下一手 ') + left;
+    if(left <= 0){
+      clearInterval(G._nextHandToastTimer);
+      G._nextHandToastTimer = null;
+      toast.classList.add('hidden');
+    }
+  };
+  update();
+  G._nextHandToastTimer = setInterval(update, 200);
+}
+function hideNextHandToast(){
+  const toast = document.getElementById('nextHandToast');
+  if(toast) toast.classList.add('hidden');
+  if(G._nextHandToastTimer){ clearInterval(G._nextHandToastTimer); G._nextHandToastTimer = null; }
+}
+
+/* ★ 玩家/房主离桌 */
 function handlePlayerLeave(peerId){
   const idx = G.players.findIndex(function(p){ return p.peerId === peerId; });
   if(idx < 0) return;
   const p = G.players[idx];
   if(p.seated === false) return;
+
   p.seated = false;
-  p.folded = true;    // 视为弃牌
+  p.folded = true;
   p.needsToAct = false;
+  p.holeCards = [];
+  p._highlight = null;
+  p.revealCards = false;
+  p.lastAction = isEn() ? 'Left' : '已离桌';
+
   log((p.name || 'Player') + (isEn() ? " left the table" : " 离桌了"), "action");
 
-  /* 如果正轮到他，把定时器清掉 */
   if(G.currentPlayerIndex === idx){
     stopTurnTimer();
     if(G._hostTimeout){ clearTimeout(G._hostTimeout); G._hostTimeout = null; }
   }
 
   render();
-  if(G.online.active && G.online.isHost){
-    broadcastFullState();
-    /* 继续推进游戏（如果还在局内） */
-    if(!G.gameOver && G.stage !== 'showdown' && G.online.started){
-      runHostTurn();
+
+  if(G.online.isHost && G.online.started && G.stage !== 'showdown'){
+    const still = G.players.filter(function(x){ return x.seated !== false && !x.folded; });
+    if(still.length <= 1){
+      const pot = G.pot;
+      awardUncontestedPot();
+      render();
+      if(G.online.isHost) broadcastFullState();
+      endHandHost(pot);
+      return;
     }
+    broadcastFullState();
+    runHostTurn();
+  } else if(G.online.isHost){
+    /* 还在等待状态，直接广播新玩家列表 */
+    if(G.online.isHost) broadcastFullState();
   }
 }
 
@@ -397,30 +576,23 @@ function renderLobby(){
 function renderRoomLists(){
   if(!window.PokerOnline || !PokerOnline.getKnownRooms) return;
   const currentId = PokerOnline.getRoomId();
-  const rooms = PokerOnline.getKnownRooms().filter(function(r){
-    return r.roomId !== currentId;
-  });
+  const rooms = PokerOnline.getKnownRooms().filter(function(r){ return r.roomId !== currentId; });
   const pointsRooms = rooms.filter(function(r){ return r.mode === 'points'; });
   const realRooms   = rooms.filter(function(r){ return r.mode === 'real'; });
-
   fillRoomList('pointsRoomList', pointsRooms);
   fillRoomList('realRoomList',   realRooms);
-
   updateRoomCount('pointsRoomCount', pointsRooms.length);
   updateRoomCount('realRoomCount',   realRooms.length);
-
   const total = pointsRooms.length + realRooms.length;
   const sl = document.getElementById('statusLabel');
-  if(sl) sl.textContent = isEn() ? (total + (total === 1 ? ' table' : ' tables'))
-                                 : (total + ' 桌开放');
+  if(sl) sl.textContent = isEn() ? (total + (total === 1 ? ' table' : ' tables')) : (total + ' 桌开放');
 }
 
 function updateRoomCount(id, n){
   const el = document.getElementById(id);
   if(!el) return;
   el.innerHTML = '<span class="pulse"></span><span>' + n + (isEn() ? (n === 1 ? ' table' : ' tables') : ' 桌') + '</span>';
-  if(n > 0) el.classList.remove('zero');
-  else el.classList.add('zero');
+  if(n > 0) el.classList.remove('zero'); else el.classList.add('zero');
 }
 
 function fillRoomList(containerId, rooms){
@@ -433,22 +605,25 @@ function fillRoomList(containerId, rooms){
     const item = document.createElement('div');
     item.className = 'room-item';
     const initial = (r.hostName || 'R').charAt(0).toUpperCase();
+    const isFull = (r.count || 1) >= (r.maxSeats || 7);
     item.innerHTML =
       '<div class="room-item-avatar">' + initial + '</div>' +
       '<div class="room-item-info">' +
-        '<div class="room-item-name">' + (r.hostName || 'Host') +
-          (isEn() ? "'s room" : ' 的房间') + '</div>' +
-        '<div class="room-item-meta">' + lv.name + ' · ' + lv.sb + '/' + lv.bb +
-          ' · ' + r.roomId + '</div>' +
+        '<div class="room-item-name">' + (r.hostName || 'Host') + (isEn() ? "'s room" : ' 的房间') + '</div>' +
+        '<div class="room-item-meta">' + lv.name + ' · ' + lv.sb + '/' + lv.bb + ' · ' + r.roomId + '</div>' +
       '</div>' +
       '<div class="room-item-players">' + (r.count || 1) + '/' + (r.maxSeats || 7) + '</div>' +
-      '<button class="room-item-join">' + (isEn() ? 'Join' : '加入') + '</button>';
-    const handler = function(e){
-      if(e && e.stopPropagation) e.stopPropagation();
-      doJoinRoom(lv, r.mode, r.roomId);
-    };
-    item.querySelector('.room-item-join').onclick = handler;
-    item.onclick = handler;
+      '<button class="room-item-join"' + (isFull ? ' disabled' : '') + '>' +
+        (isFull ? (isEn() ? 'Full' : '已满') : (isEn() ? 'Join' : '加入')) +
+      '</button>';
+    if(!isFull){
+      const handler = function(e){
+        if(e && e.stopPropagation) e.stopPropagation();
+        doJoinRoom(lv, r.mode, r.roomId);
+      };
+      item.querySelector('.room-item-join').onclick = handler;
+      item.onclick = handler;
+    }
     el.appendChild(item);
   });
 }
@@ -524,9 +699,9 @@ function renderTableGrid(containerId, mode){
 
 /* ========== AI 场 ========== */
 function openAiLevel(lv){
-  /* ★ 开新局前清状态 */
   resetSessionState();
   resetTableDom();
+  hideWaitingBar();
 
   G.gameMode = 'ai';
   let ai = PokerStorage.getAiChips();
@@ -613,9 +788,7 @@ function createRoom(lv, mode){
   if(!checkOnlinePreconditions(lv, mode)) return;
   const roomId = generateRoomId(lv, mode);
 
-  PokerOnline.createRoom(roomId, {
-    level: lv.key, mode: mode
-  }).then(function(){
+  PokerOnline.createRoom(roomId, { level: lv.key, mode: mode }).then(function(){
     enterOnlineRoom(lv, mode, roomId, true);
   }).catch(function(err){
     console.error(err);
@@ -648,8 +821,8 @@ function doJoinRoom(lv, mode, roomId){
   });
 }
 
+/* ★ 进房：进桌 → 清残局 → 显示等待栏 */
 function enterOnlineRoom(lv, mode, roomId, isHost){
-  /* ★ 关键：先彻底清掉上一局的牌桌状态和 DOM，避免残局 */
   resetSessionState();
   resetTableDom();
 
@@ -660,20 +833,20 @@ function enterOnlineRoom(lv, mode, roomId, isHost){
   G.bigBlind = lv.bb;
   G.lastRaiseAmount = lv.bb;
   G.gameOver = false;
+  G.stage = 'waiting';
   G.sessionBuyIn = 10000;
   G.sessionHands = 0;
   G.online = {
-    active: true,
-    isHost: isHost,
-    roomId: roomId,
-    mySeat: 0,
-    started: false,
-    broadcastTimer: null
+    active: true, isHost: isHost, roomId: roomId,
+    mySeat: 0, started: false, broadcastTimer: null
   };
+  G._lastStateSig = ''; G._lastActionSig = ''; G._lastBoardSig = ''; G._lastHandSig = '';
+  G._timerKey = null; G._nextHandEndsAt = 0; G._turnEndsAt = 0;
 
   $("lobbyScreen").classList.add("hidden");
   $("gameScreen").classList.remove("hidden");
-  $("onlineLobby").classList.remove("hidden");
+  /* ★ 不再显示旧版等待室遮罩 */
+  $("onlineLobby").classList.add("hidden");
 
   if($("gameLevelLabel")) $("gameLevelLabel").textContent = lv.name + " " + lv.sb + "/" + lv.bb + " · " + (isEn() ? "Online" : "联机");
   if($("gameModeLabel")){
@@ -682,57 +855,18 @@ function enterOnlineRoom(lv, mode, roomId, isHost){
   }
   if($("gameWalletPill")) $("gameWalletPill").innerHTML = '<span class="dot" style="background:#a855f7;"></span><span>' + (isEn() ? "Waiting" : "等待中") + '</span>';
 
-  if($("onlineLobbyCode")) $("onlineLobbyCode").textContent = roomId;
-
   clearLog();
   log((isEn() ? "Room: " : "房间号：") + roomId, "hl");
   log(isEn() ? "Waiting for players..." : "等待其他玩家加入...", "hl");
-  updateOnlineLobbyUI();
 
-  const copyBtn = $("copyRoomBtn");
-  if(copyBtn) copyBtn.onclick = function(){
-    try {
-      navigator.clipboard.writeText(roomId);
-      copyBtn.textContent = isEn() ? "Copied!" : "已复制";
-      setTimeout(function(){ copyBtn.textContent = isEn() ? "Copy" : "复制"; }, 1500);
-    } catch(e){ alert(roomId); }
-  };
-
-  const readyBtn = $("onlineReadyBtn");
-  if(readyBtn){
-    readyBtn.textContent = isEn() ? "Ready" : "准备好了";
-    readyBtn.onclick = function(){
-      const isReady = PokerOnline.toggleReady();
-      readyBtn.textContent = isReady ? (isEn() ? "Cancel ready" : "取消准备") : (isEn() ? "Ready" : "准备好了");
-      updateOnlineLobbyUI();
-    };
-  }
-
-  const leaveBtn = $("onlineLeaveBtn");
-  if(leaveBtn) leaveBtn.onclick = function(){ backToLobby(); };
+  showWaitingBar();
+  syncWaitingSeatsFromRoom();
+  hideHumanActions();
 }
 
 function updateOnlineLobbyUI(){
-  const players = window.PokerOnline ? PokerOnline.getRoomPlayers() : {};
-  const ids = Object.keys(players);
-  const countEl = $("onlineLobbyCount"); if(countEl) countEl.textContent = ids.length + " / " + ONLINE_MAX_SEATS;
-  const listEl = $("onlineLobbyList"); if(!listEl) return;
-  listEl.innerHTML = "";
-  ids.forEach(function(pid){
-    const p = players[pid];
-    const row = document.createElement("div");
-    row.className = "online-lobby-item";
-    const initial = (p.name || 'P').charAt(0).toUpperCase();
-    const status = p.ready
-      ? '<span class="online-ready">✓ ' + (isEn() ? "Ready" : "已准备") + '</span>'
-      : '<span class="online-notready">' + (isEn() ? "Not ready" : "未准备") + '</span>';
-    row.innerHTML =
-      '<span class="online-player-name">' +
-        '<span class="online-avatar">' + initial + '</span> ' +
-        (p.isSelf ? "👤 " : "") + p.name + (p.isSelf ? (isEn() ? " (you)" : " (你)") : "") +
-      '</span>' + status;
-    listEl.appendChild(row);
-  });
+  /* 保留以兼容旧调用 —— 现在准备室在桌面底部条里 */
+  updateWaitingBar();
 }
 
 /* ========== 房主开始游戏 ========== */
@@ -741,45 +875,47 @@ function hostStartGame(playerOrder, playersInfo){
   if(G.online.started) return;
 
   const myId = PokerOnline.getMyId();
-  G.players = playerOrder.map(function(pid, idx){
-    const info = playersInfo.find(function(p){ return p.peerId === pid; }) || { name: 'Player' };
+
+  /* 按 seat 排序，保留座位号 */
+  const ordered = playerOrder.slice().sort(function(a, b){
+    const ia = playersInfo.find(function(p){ return p.peerId === a; });
+    const ib = playersInfo.find(function(p){ return p.peerId === b; });
+    return (ia && ia.seat || 0) - (ib && ib.seat || 0);
+  });
+
+  G.players = ordered.map(function(pid){
+    const info = playersInfo.find(function(p){ return p.peerId === pid; }) || { name:'Player', seat: 0 };
     const isSelf = pid === myId;
     return {
-      id: idx, peerId: pid,
+      id: info.seat || 0, peerId: pid,
       name: info.name,
       emoji: isSelf ? PokerAvatars.HUMAN.emoji : '🎮',
       bg: isSelf ? PokerAvatars.HUMAN.bg : 'linear-gradient(135deg,#a855f7,#6d28d9)',
       isHuman: isSelf,
-      chips: 10000,
-      seated: true,
+      chips: 10000, seated: true,
       holeCards: [], folded:false, allIn:false, currentBet:0,
       totalContributed:0, needsToAct:false,
       position:"", positionKey:"", lastAction:"", styleKey:null,
       revealCards:false, _highlight:null, preflopOrder:0, postflopOrder:0
     };
   });
-  G.online.mySeat = playerOrder.indexOf(myId);
+  G.online.mySeat = G.players.findIndex(function(p){ return p.peerId === myId; });
   G.totalPlayers = G.players.length;
-  G.seatPositions = computeSeatPositions(G.players.length);
+  G.seatPositions = computeSeatPositions(ONLINE_MAX_SEATS);
   G.dealerIndex = Math.floor(Math.random() * G.players.length);
   G.handNumber = 0;
   G.gameOver = false;
   G.online.started = true;
+  G.stage = 'preflop';
 
-  G._lastStateSig = '';
-  G._lastActionSig = '';
-  G._lastBoardSig = '';
-  G._lastHandSig = '';
-  G._timerKey = null;
+  G._lastStateSig = ''; G._lastActionSig = ''; G._lastBoardSig = ''; G._lastHandSig = '';
 
-  $("onlineLobby").classList.add("hidden");
+  hideWaitingBar();
   if($("gameWalletPill")) $("gameWalletPill").innerHTML = '<span class="dot" style="background:#a855f7;"></span><span>' + G.players.length + (isEn() ? " players" : " 人联机") + '</span>';
 
   const startPayload = {
-    playerOrder: playerOrder,
-    players: G.players.map(function(p){
-      return { id: p.id, peerId: p.peerId, name: p.name };
-    })
+    playerOrder: ordered,
+    players: G.players.map(function(p){ return { id: p.id, peerId: p.peerId, name: p.name, seat: p.id }; })
   };
   PokerOnline.sendGameStart(startPayload);
 
@@ -789,17 +925,19 @@ function hostStartGame(playerOrder, playersInfo){
 /* ========== 房主发一手 ========== */
 async function startNewHandHost(){
   if(G._nextHandTimer){ clearInterval(G._nextHandTimer); G._nextHandTimer = null; }
+  if(G._nextHandToastTimer){ clearInterval(G._nextHandToastTimer); G._nextHandToastTimer = null; }
+  hideNextHandToast();
+
   G.handNumber++;
   G.sessionHands++;
   G.pot = 0; G.community = [];
   G.currentBet = 0; G.lastRaiseAmount = G.bigBlind;
   G.stage = "preflop"; G.busy = false;
+  G._nextHandEndsAt = 0;
   G.deck = PokerDeck.create();
   PokerDeck.shuffle(G.deck);
   G._renderedCards = new WeakSet();
-  G._lastBoardSig = '';
-  G._lastHandSig = '';
-  G._lastActionSig = '';
+  G._lastBoardSig = ''; G._lastHandSig = ''; G._lastActionSig = '';
   stopTurnTimer();
 
   G.players.forEach(function(p){
@@ -859,24 +997,23 @@ function startPreflopHost(){
 function runHostTurn(){
   if(G.gameOver) return;
 
-  /* ★ 无人跟注直接结算 */
+  /* 无人跟注 → 立即结算 */
   if(countActive() <= 1){
     const pot = G.pot;
     awardUncontestedPot();
     render();
-    if(G.online.active && G.online.isHost) broadcastFullState();
+    if(G.online.isHost) broadcastFullState();
     endHandHost(pot);
     return;
   }
 
-  const notAllIn = G.players.filter(function(p){
-    return p.seated !== false && !p.folded && !p.allIn;
-  });
+  const notAllIn = G.players.filter(function(p){ return p.seated !== false && !p.folded && !p.allIn; });
   if(notAllIn.length === 0){ advanceStageHost(); return; }
   if(notAllIn.length === 1 && notAllIn.every(function(p){ return !p.needsToAct; })){ advanceStageHost(); return; }
   if(!findNextToAct()){ advanceStageHost(); return; }
 
   const p = G.players[G.currentPlayerIndex];
+  G._turnEndsAt = Date.now() + 30000;
   render();
   broadcastFullState();
 
@@ -901,13 +1038,11 @@ function runHostTurn(){
 
 function advanceStageHost(){
   stopTurnTimer();
-
-  /* ★ 无人跟注直接结算 */
   if(countActive() <= 1){
     const pot = G.pot;
     awardUncontestedPot();
     render();
-    if(G.online.active && G.online.isHost) broadcastFullState();
+    if(G.online.isHost) broadcastFullState();
     endHandHost(pot);
     return;
   }
@@ -1007,6 +1142,7 @@ function resolveHost(cont){
   G.pot = 0; G.busy = false;
   PokerAudio.play('win');
   render();
+  if(G.online.isHost) broadcastFullState();
   endHandHost(totalPot);
 }
 
@@ -1014,9 +1150,9 @@ function endHandHost(totalPot){
   const me = G.players[G.online.mySeat];
   if(me) PokerStorage.recordHand(me.chips - G.playerHandStartChips, totalPot || 0);
   render();
-  if(G.online.active && G.online.isHost) broadcastFullState();
-  /* ★ 8 秒倒计时下一手 */
-  scheduleNextHand(startNewHandHost);
+  if(G.online.isHost) broadcastFullState();
+  /* 房主 8 秒倒计时下一手 */
+  beginNextHandCountdown(startNewHandHost);
 }
 
 function broadcastFullState(){
@@ -1040,25 +1176,39 @@ function broadcastFullState(){
     dealerIndex: G.dealerIndex, currentPlayerIndex: G.currentPlayerIndex,
     community: G.community, handNumber: G.handNumber,
     smallBlind: G.smallBlind, bigBlind: G.bigBlind,
-    gameOver: G.gameOver
+    gameOver: G.gameOver,
+    /* ★ 新增时间戳与阶段 */
+    phase: G.online.started ? 'playing' : 'waiting',
+    nextHandEndsAt: G._nextHandEndsAt || 0,
+    turnEndsAt: G._turnEndsAt || 0
   };
   PokerOnline.sendFullState(state);
 }
 
-/* ========== 客户端：渲染房主推来的状态 ========== */
+/* ========== 客户端：应用状态 ========== */
 function applyFullState(state){
   if(!state || !state.players) return;
 
-  /* 状态指纹：状态没变直接返回 */
   const sig = buildStateSig(state);
   if(sig && sig === G._lastStateSig && G.players.length === state.players.length){
+    /* 状态没变，但倒计时可能要继续，交给下面 tick 处理 */
+    syncCountdownFromState(state);
     return;
   }
   G._lastStateSig = sig;
 
+  /* ★ 等待阶段：走等待界面渲染 */
+  if(state.phase === 'waiting' || (!G.online.started && !state.handNumber)){
+    G.stage = 'waiting';
+    G.online.started = false;
+    showWaitingBar();
+    syncCountdownFromState(state);
+    return;
+  }
+
   const myId = PokerOnline.getMyId();
 
-  /* ★ 关键：用 peerId 判断是否同一批人。不同 → 重建；相同 → 保留引用只更新字段 */
+  /* ★ 用 peerId 判断阵容是否变化，而不是长度 */
   const sameRoster =
     G.players.length === state.players.length &&
     G.players.every(function(p, i){
@@ -1069,7 +1219,7 @@ function applyFullState(state){
     const existingByPeer = {};
     G.players.forEach(function(p){ if(p.peerId) existingByPeer[p.peerId] = p; });
 
-    G.players = state.players.map(function(p, i){
+    G.players = state.players.map(function(p){
       const isSelf = p.peerId === myId;
       const existing = existingByPeer[p.peerId];
       if(existing){
@@ -1083,8 +1233,7 @@ function applyFullState(state){
         emoji: isSelf ? PokerAvatars.HUMAN.emoji : '🎮',
         bg: isSelf ? PokerAvatars.HUMAN.bg : 'linear-gradient(135deg,#a855f7,#6d28d9)',
         isHuman: isSelf,
-        chips: p.chips,
-        seated: true,
+        chips: p.chips, seated: p.seated !== false,
         holeCards: [], folded:false, allIn:false, currentBet:0,
         totalContributed:0, needsToAct:false,
         position:"", positionKey:"", lastAction:"", styleKey:null,
@@ -1093,20 +1242,16 @@ function applyFullState(state){
     });
     G.online.mySeat = G.players.findIndex(function(p){ return p.peerId === myId; });
     G.totalPlayers = G.players.length;
-    G.seatPositions = computeSeatPositions(G.players.length);
+    G.seatPositions = computeSeatPositions(ONLINE_MAX_SEATS);
     G.online.started = true;
-    $("onlineLobby").classList.add("hidden");
+    hideWaitingBar();
     if($("gameWalletPill")) $("gameWalletPill").innerHTML = '<span class="dot" style="background:#a855f7;"></span><span>' + G.players.length + (isEn() ? " players" : " 人联机") + '</span>';
-    G._lastBoardSig = '';
-    G._lastHandSig = '';
-    G._lastActionSig = '';
+    G._lastBoardSig = ''; G._lastHandSig = ''; G._lastActionSig = '';
   }
 
   if(state.handNumber !== G.handNumber){
     G._renderedCards = new WeakSet();
-    G._lastBoardSig = '';
-    G._lastHandSig = '';
-    G._lastActionSig = '';
+    G._lastBoardSig = ''; G._lastHandSig = ''; G._lastActionSig = '';
   }
 
   state.players.forEach(function(sp, i){
@@ -1142,6 +1287,7 @@ function applyFullState(state){
   const gh = $("gameHandLabel");
   if(gh) gh.textContent = t("handShortLabel", { n:G.handNumber });
 
+  syncCountdownFromState(state);
   render();
 
   const meIdx = G.online.mySeat;
@@ -1160,6 +1306,39 @@ function applyFullState(state){
     }
   } else {
     hideHumanActions();
+  }
+}
+
+/* ★ 从 state 里同步倒计时 UI */
+function syncCountdownFromState(state){
+  /* 下一手倒计时 */
+  if(state.nextHandEndsAt && state.nextHandEndsAt > Date.now()){
+    G._nextHandEndsAt = state.nextHandEndsAt;
+    showNextHandToast(state.nextHandEndsAt);
+  } else {
+    if(G._nextHandEndsAt){ G._nextHandEndsAt = 0; hideNextHandToast(); }
+  }
+  /* 房主的思考倒计时，也同步给所有客户端 */
+  if(state.turnEndsAt && state.turnEndsAt > Date.now() && !G.turnTimer){
+    const el = document.getElementById('turnTimer');
+    if(el) el.classList.remove('hidden');
+    if(G._turnTickTimer){ clearInterval(G._turnTickTimer); }
+    const endAt = state.turnEndsAt;
+    const update = function(){
+      const left = Math.max(0, endAt - Date.now());
+      const f = document.getElementById('timerFill');
+      const txt = document.getElementById('timerText');
+      if(f) f.style.width = (left / 30000 * 100) + '%';
+      if(txt) txt.textContent = Math.ceil(left / 1000) + 's';
+      if(left <= 0){
+        clearInterval(G._turnTickTimer);
+        G._turnTickTimer = null;
+        const el2 = document.getElementById('turnTimer');
+        if(el2) el2.classList.add('hidden');
+      }
+    };
+    update();
+    G._turnTickTimer = setInterval(update, 200);
   }
 }
 
@@ -1185,7 +1364,6 @@ function handleOnlineMessage(msg){
       case 'sync_request':
         if(G.online.started) broadcastFullState();
         break;
-      /* ★ 有人离桌 */
       case 'player_leave':
         handlePlayerLeave(msg.peerId);
         break;
@@ -1199,21 +1377,43 @@ function handleOnlineMessage(msg){
     case 'full_state':
       applyFullState(msg.state);
       break;
-    /* ★ 客户端收到 player_leave：本地把该玩家标记为已离桌（等房主广播新状态前先乐观更新） */
     case 'player_leave': {
       const p = G.players.find(function(x){ return x.peerId === msg.peerId; });
       if(p){
         p.seated = false;
         p.folded = true;
-        p.needsToAct = false;
+        p.holeCards = [];
+        p._highlight = null;
+        p.revealCards = false;
+        p.lastAction = isEn() ? 'Left' : '已离桌';
         render();
       }
       break;
     }
-    /* ★ 房主离桌 */
     case 'host_left': {
       alert(isEn() ? "Host left the room" : "房主已离开房间");
-      backToLobby();
+      /* 客户端不再主动 leaveRoom，避免重复 */
+      G.online.active = false;
+      resetSessionState();
+      resetTableDom();
+      hideWaitingBar();
+      $("gameScreen").classList.add("hidden");
+      $("lobbyScreen").classList.remove("hidden");
+      showScreen("lobby");
+      renderRoomLists();
+      break;
+    }
+    case 'room_full': {
+      alert(isEn() ? "Room is full (max 7)" : "房间已满（最多 7 人）");
+      /* 客户端主动退房 */
+      try { PokerOnline.leaveRoom(); } catch(e){}
+      G.online.active = false;
+      resetSessionState();
+      resetTableDom();
+      hideWaitingBar();
+      $("gameScreen").classList.add("hidden");
+      $("lobbyScreen").classList.remove("hidden");
+      showScreen("lobby");
       break;
     }
   }
@@ -1309,17 +1509,19 @@ async function playDealAnimation(){
 
 async function startNewHandAi(){
   if(G._nextHandTimer){ clearInterval(G._nextHandTimer); G._nextHandTimer = null; }
+  if(G._nextHandToastTimer){ clearInterval(G._nextHandToastTimer); G._nextHandToastTimer = null; }
+  hideNextHandToast();
+
   G.handNumber++;
   G.sessionHands++;
   G.pot = 0; G.community = [];
   G.currentBet = 0; G.lastRaiseAmount = G.bigBlind;
   G.stage = "preflop"; G.busy = false;
+  G._nextHandEndsAt = 0;
   G.deck = PokerDeck.create();
   PokerDeck.shuffle(G.deck);
   G._renderedCards = new WeakSet();
-  G._lastBoardSig = '';
-  G._lastHandSig = '';
-  G._lastActionSig = '';
+  G._lastBoardSig = ''; G._lastHandSig = ''; G._lastActionSig = '';
   stopTurnTimer();
 
   G.players.forEach(function(p){
@@ -1419,8 +1621,6 @@ function myIndex(){
 
 function runTurnAi(){
   if(G.gameOver || G.busy) return;
-
-  /* ★ 无人跟注直接结算 */
   if(countActive() <= 1){
     const pot = G.pot;
     awardUncontestedPot();
@@ -1428,7 +1628,6 @@ function runTurnAi(){
     endHandAi(pot);
     return;
   }
-
   const notAllIn = G.players.filter(function(p){ return !p.folded && !p.allIn; });
   if(notAllIn.length === 0){ advanceStageAi(); return; }
   if(!findNextToAct()){ advanceStageAi(); return; }
@@ -1454,8 +1653,6 @@ function runTurnAi(){
 
 function advanceStageAi(){
   stopTurnTimer();
-
-  /* ★ 无人跟注直接结算 */
   if(countActive() <= 1){
     const pot = G.pot;
     awardUncontestedPot();
@@ -1463,7 +1660,6 @@ function advanceStageAi(){
     endHandAi(pot);
     return;
   }
-
   G.players.forEach(function(p){ p.currentBet = 0; p.lastAction = ""; });
   G.currentBet = 0; G.lastRaiseAmount = G.bigBlind;
   if(G.stage === "preflop"){
@@ -1553,14 +1749,13 @@ function executeAction(player, action){
     log(oldBet === 0 ? t("playerBets",{name:player.name,amt:fmtNum(target)}) : t("playerRaises",{name:player.name,amt:fmtNum(target)}), "action");
     PokerAudio.play('raise');
     G.players.forEach(function(p){
-      if(p !== player && !p.folded && !p.allIn && p.chips > 0) p.needsToAct = true;
+      if(p !== player && !p.folded && !p.allIn && p.chips > 0 && p.seated !== false) p.needsToAct = true;
     });
   }
 }
 
 function endHandAi(totalPot){
   stopTurnTimer();
-  /* 如果 awardUncontestedPot 已经派过，G.pot = 0，不会重复派 */
   const alive = G.players.filter(function(p){ return p.seated !== false && !p.folded; });
   const w = alive[0];
   if(!w) return;
@@ -1575,8 +1770,7 @@ function endHandAi(totalPot){
   PokerStorage.recordHand(me.chips - G.playerHandStartChips, (totalPot || pot));
   render();
   if(me.chips <= 0){ setTimeout(showRebuy, 800); return; }
-  /* ★ 8 秒倒计时下一手 */
-  scheduleNextHand(startNewHandAi);
+  beginNextHandCountdown(startNewHandAi);
 }
 
 function calculateSidePots(){
@@ -1652,8 +1846,7 @@ function resolveAi(cont){
   PokerStorage.recordHand(me.chips - G.playerHandStartChips, totalPot);
   render();
   if(me.chips <= 0){ setTimeout(showRebuy, 800); return; }
-  /* ★ 8 秒倒计时下一手 */
-  scheduleNextHand(startNewHandAi);
+  beginNextHandCountdown(startNewHandAi);
 }
 
 function showRebuy(){
@@ -1694,7 +1887,6 @@ function backToLobby(){
     try { PokerOnline.sendHostLeft(); } catch(e){}
   }
 
-  /* 结算 */
   const me = G.players[myIndex()];
   if(me && G.sessionBuyIn > 0){
     const pnl = me.chips - G.sessionBuyIn;
@@ -1708,15 +1900,16 @@ function backToLobby(){
     });
   }
 
-  /* 离开联机频道（先 send leave 再延迟移除） */
   if(G.online.active){
     try { PokerOnline.leaveRoom(); } catch(e){}
     G.online.active = false;
   }
 
-  /* ★ 彻底清掉牌桌层状态和 DOM */
+  /* ★ 彻底清掉牌桌层 + DOM */
   resetSessionState();
   resetTableDom();
+  hideWaitingBar();
+  hideNextHandToast();
 
   G.gameOver = true;
   $("gameScreen").classList.add("hidden");
@@ -1755,15 +1948,29 @@ function posCls(k){
 }
 
 function render(){
-  if(!G.players.length) return;
   const container = $("seatsLayer");
   if(!container) return;
+
+  /* ★ 等待状态：渲染固定 7 座，空格子画虚线 */
+  if(G.online.active && G.stage === 'waiting'){
+    renderWaitingTable(container);
+    /* 底池/公共牌/手牌区清空 */
+    const bc = document.getElementById('boardCards'); if(bc) bc.innerHTML = '';
+    const pm = document.getElementById('potMain'); if(pm) pm.textContent = '0';
+    const ps = document.getElementById('potSideWrap'); if(ps) ps.classList.add('hidden');
+    const handArea = document.getElementById('handCardsLarge'); if(handArea) handArea.innerHTML = '';
+    const sl = document.getElementById('stageLabel');
+    if(sl) sl.textContent = isEn() ? 'Waiting' : '等待中';
+    return;
+  }
+
+  if(!G.players.length) return;
 
   for(let i = 0; i < G.players.length; i++){
     const p = G.players[i];
     const style = p.isHuman ? null : PokerAI.STYLES[p.styleKey];
     let seat = container.querySelector('.seat[data-pid="' + p.id + '"]');
-    const pos = G.seatPositions[i] || { x:50, y:50 };
+    const pos = G.seatPositions[p.id] || { x:50, y:50 };
 
     if(!seat){
       seat = document.createElement("div");
@@ -1774,16 +1981,18 @@ function render(){
 
     seat.style.left = pos.x + "%";
     seat.style.top = pos.y + "%";
-    seat.classList.toggle("folded", !!p.folded);
+    seat.classList.toggle("folded", !!p.folded || p.seated === false);
     seat.classList.toggle("reveal", !!p.revealCards);
-    /* 离桌的座位加一个 empty 类 */
     seat.classList.toggle("empty", p.seated === false);
     seat.classList.toggle("active", G.currentPlayerIndex === i && !G.gameOver && !p.folded && G.stage !== "showdown");
 
     let betInfo = "";
-    if(p.currentBet > 0) betInfo = t("actionBet") + " " + fmtNum(p.currentBet);
-    if(p.lastAction) betInfo += (betInfo ? " · " : "") + p.lastAction;
-    if(p.seated === false) betInfo = (isEn() ? "Left" : "已离桌");
+    if(p.seated === false){
+      betInfo = isEn() ? "Left" : "已离桌";
+    } else {
+      if(p.currentBet > 0) betInfo = t("actionBet") + " " + fmtNum(p.currentBet);
+      if(p.lastAction) betInfo += (betInfo ? " · " : "") + p.lastAction;
+    }
 
     const posHtml = p.position ? '<span class="pos-badge ' + posCls(p.positionKey) + '">' + p.position + '</span>' : '';
     let styleHtml = '';
@@ -1822,7 +2031,7 @@ function render(){
     const cards = seat.querySelector(".seat-cards");
     let nextCards = [];
     let showFace = false;
-    if(p.folded || p.holeCards.length < 2 || p.seated === false){
+    if(p.seated === false || p.folded || p.holeCards.length < 2){
       nextCards = [null, null];
     } else if(p.revealCards || i === myIndex()){
       nextCards = p.holeCards;
@@ -1837,8 +2046,8 @@ function render(){
       if(!showFace){
         const a = renderCardBackMini();
         const b = renderCardBackMini();
-        if(p.folded || p.holeCards.length < 2 || p.seated === false){
-          a.style.opacity = ".3"; b.style.opacity = ".3";
+        if(p.seated === false || p.folded || p.holeCards.length < 2){
+          a.style.opacity = ".2"; b.style.opacity = ".2";
         }
         cards.appendChild(a); cards.appendChild(b);
       } else {
@@ -1849,7 +2058,7 @@ function render(){
     }
   }
 
-  /* 移除已不在 players 里的座位 */
+  /* 移除已不存在的座位 */
   Array.prototype.slice.call(container.querySelectorAll('.seat')).forEach(function(el){
     const pid = el.getAttribute('data-pid');
     const exists = G.players.some(function(p){ return String(p.id) === String(pid); });
@@ -1888,16 +2097,79 @@ function render(){
   updateHandInfo();
 }
 
+/* ★ 等待状态下的 7 座渲染 */
+function renderWaitingTable(container){
+  /* 保留等待栏相关的兄弟节点，先清空座位 */
+  Array.prototype.slice.call(container.querySelectorAll('.seat')).forEach(function(el){ el.remove(); });
+  /* 特殊：清理旧座位上可能挂的 ready badge */
+  Array.prototype.slice.call(container.querySelectorAll('.seat-empty-slot')).forEach(function(el){ el.remove(); });
+
+  const myId = window.PokerOnline ? PokerOnline.getMyId() : null;
+  const players = window.PokerOnline ? PokerOnline.getRoomPlayers() : {};
+  const mySeat = G.online.mySeat;
+
+  for(let seatIdx = 0; seatIdx < ONLINE_MAX_SEATS; seatIdx++){
+    /* 找占用这个座位的玩家 */
+    let p = null;
+    for(const pid in players){
+      if(players[pid].seat === seatIdx){ p = { peerId: pid, info: players[pid] }; break; }
+    }
+    const pos = G.seatPositions[seatIdx] || { x:50, y:50 };
+
+    if(!p){
+      /* 空格子 */
+      const empty = document.createElement("div");
+      empty.className = "seat empty seat-empty-slot";
+      empty.setAttribute("data-seat", seatIdx);
+      empty.style.left = pos.x + "%";
+      empty.style.top = pos.y + "%";
+      empty.innerHTML = '<div class="empty-label">' + (isEn() ? 'Empty' : '空位') + '</div>';
+      container.appendChild(empty);
+      continue;
+    }
+
+    const isSelf = p.peerId === myId;
+    const seat = document.createElement("div");
+    seat.className = "seat";
+    seat.setAttribute("data-seat", seatIdx);
+    seat.style.left = pos.x + "%";
+    seat.style.top = pos.y + "%";
+    if(isSelf) seat.classList.add("active");
+
+    const initial = (p.info.name || 'P').charAt(0).toUpperCase();
+    const bg = isSelf ? PokerAvatars.HUMAN.bg : 'linear-gradient(135deg,#a855f7,#6d28d9)';
+    const readyBadge = p.info.ready
+      ? '<div class="ready-badge">✓ ' + (isEn() ? 'Ready' : '已准备') + '</div>'
+      : '<div class="not-ready-badge">' + (isEn() ? 'Waiting' : '未准备') + '</div>';
+
+    seat.innerHTML =
+      readyBadge +
+      '<div class="seat-head">' +
+        '<div class="avatar-wrap" style="background:' + bg + '">' + initial + '</div>' +
+        '<div class="seat-meta">' +
+          '<div class="seat-name">' + p.info.name + (isSelf ? (isEn() ? ' (you)' : ' (你)') : '') + '</div>' +
+          '<div><span class="seat-style">P2P</span></div>' +
+        '</div>' +
+      '</div>' +
+      '<div class="seat-chips">10,000 ' + t("chips") + '</div>' +
+      '<div class="seat-bet">' + (isEn() ? 'Seat ' : '座位 ') + (seatIdx + 1) + '</div>';
+    container.appendChild(seat);
+  }
+}
+
 function renderHumanHand(){
   const me = G.players[myIndex()];
-  if(!me) return;
+  if(!me){
+    const c = $("handCardsLarge"); if(c) c.innerHTML = "";
+    return;
+  }
   const c = $("handCardsLarge");
   if(!c) return;
   const bem = $("handBem");
   if(bem) bem.textContent = G.gameMode === 'real' ? "≈ " + toBem(me.chips) + " BEM" : fmtNum(me.chips) + (isEn() ? " chips" : " 筹码");
 
   let sig;
-  if(!me || me.folded || me.holeCards.length < 2){
+  if(!me || me.folded || me.holeCards.length < 2 || G.stage === 'waiting'){
     sig = 'empty';
   } else {
     sig = cardsSig(me.holeCards) + '|' + (me._highlight ? cardsSig(Array.from(me._highlight)) : '');
@@ -1935,7 +2207,6 @@ function updateHandInfo(){
     '<div class="row"><span>' + t("infoToCall") + '</span><strong>' + fmtNum(toCall) + '</strong></div>';
 }
 
-/* ★ showHumanControls：加注面板打开时绝不重建 */
 function showHumanControls(){
   const me = G.players[myIndex()];
   if(!me) return;
@@ -1943,7 +2214,7 @@ function showHumanControls(){
   const panel = $("raisePanel");
   if(!box || !panel) return;
 
-  if(me.seated === false || me.folded || me.allIn || me.chips <= 0 || G.currentPlayerIndex !== myIndex()){
+  if(G.stage === 'waiting' || me.seated === false || me.folded || me.allIn || me.chips <= 0 || G.currentPlayerIndex !== myIndex()){
     hideHumanActions();
     return;
   }
@@ -2030,6 +2301,7 @@ function applyRaisePreset(preset){
 function doHumanAction(action){
   const me = G.players[myIndex()];
   if(!me || me.folded || me.allIn || me.seated === false) return;
+  if(G.stage === 'waiting') return;
   if(G.currentPlayerIndex !== myIndex()) return;
   stopTurnTimer();
   hideHumanActions();
@@ -2063,7 +2335,7 @@ function startTurnTimer(player){
     if(G.turnTimeLeft <= 0){
       stopTurnTimer();
       const me = G.players[myIndex()];
-      if(me && !me.folded && !me.allIn){
+      if(me && !me.folded && !me.allIn && me.seated !== false){
         log(t("timeoutFold", { name:me.name }), "action");
         doHumanAction({ type:"fold" });
       }
@@ -2074,6 +2346,7 @@ function startTurnTimer(player){
 }
 function stopTurnTimer(){
   if(G.turnTimer){ clearInterval(G.turnTimer); G.turnTimer = null; }
+  if(G._turnTickTimer){ clearInterval(G._turnTickTimer); G._turnTickTimer = null; }
   G._timerKey = null;
   const tt = $("turnTimer"); if(tt) tt.classList.add("hidden");
 }
@@ -2142,11 +2415,13 @@ document.addEventListener("DOMContentLoaded", function(){
     PokerOnline.init().then(function(){
       PokerOnline.setMessageCallback(handleOnlineMessage);
       PokerOnline.setPlayersCallback(function(){
-        updateOnlineLobbyUI();
+        updateWaitingBar();
+        /* ★ 名单变化时同步等待座位 */
+        if(G.online.active && (G.stage === 'waiting' || !G.online.started)){
+          syncWaitingSeatsFromRoom();
+        }
       });
-      PokerOnline.setRoomsCallback(function(){
-        renderRoomLists();
-      });
+      PokerOnline.setRoomsCallback(function(){ renderRoomLists(); });
       renderLobby();
     }).catch(function(err){
       console.warn('Supabase init failed', err);
