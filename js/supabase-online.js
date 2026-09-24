@@ -143,6 +143,9 @@ window.PokerOnline = (function(){
 
     channel.on('broadcast', { event: 'leave' }, (payload) => {
       const p = payload.payload;
+      if(!p || !p.peerId) return;
+      // 如果是房主自己发的 leave，跳过（避免自删）
+      if(p.peerId === myId) return;
       if(roomPlayers[p.peerId]){
         delete roomPlayers[p.peerId];
         broadcastPlayerList();
@@ -150,7 +153,6 @@ window.PokerOnline = (function(){
         try { channel.send({ type:'broadcast', event:'player_leave', payload: { peerId: p.peerId } }); } catch(e){}
         if(onMessage) onMessage({ type: 'player_leave', peerId: p.peerId });
         announceRoom();
-        /* 准备室里有人走，如果之前凑齐了，现在可能不够，检查一下 */
         if(isHost) tryStartGame();
       }
     });
@@ -214,7 +216,10 @@ window.PokerOnline = (function(){
 
     channel.on('broadcast', { event: 'leave' }, (payload) => {
       const p = payload.payload;
-      if(roomPlayers[p.peerId]){ delete roomPlayers[p.peerId]; notifyPlayers(); }
+      if(p && p.peerId && roomPlayers[p.peerId]){
+        delete roomPlayers[p.peerId];
+        notifyPlayers();
+      }
     });
 
     channel.on('broadcast', { event: 'player_leave' }, (payload) => {
@@ -288,8 +293,9 @@ window.PokerOnline = (function(){
   }
 
   function send(event, payload){
-    if(!channel) return;
-    try { channel.send({ type: 'broadcast', event: event, payload: payload }); } catch(e){}
+    if(!channel) return null;
+    try { return channel.send({ type: 'broadcast', event: event, payload: payload }); }
+    catch(e){ return null; }
   }
 
   function sendFullState(state){ send('full_state', state); }
@@ -309,16 +315,34 @@ window.PokerOnline = (function(){
     return me.ready;
   }
 
+  /* ★ 关键修复：等待 send 完成再 removeChannel，确保 leave 消息真的发出去 */
   function leaveRoom(){
     if(heartbeatTimer){ clearInterval(heartbeatTimer); heartbeatTimer = null; }
     if(isHost) stopAnnounce();
 
     const ch = channel;
     channel = null;
+
     if(ch){
-      try { ch.send({ type: 'broadcast', event: 'leave', payload: { peerId: myId } }); } catch(e){}
-      setTimeout(function(){ try { supabase.removeChannel(ch); } catch(e){} }, 250);
+      let sent;
+      try { sent = ch.send({ type: 'broadcast', event: 'leave', payload: { peerId: myId } }); }
+      catch(e){ sent = null; }
+
+      const cleanup = function(){
+        try { supabase.removeChannel(ch); } catch(e){}
+      };
+
+      if(sent && typeof sent.then === 'function'){
+        // 等 send 完成 + 300ms 缓冲，让消息进到 WebSocket 队列
+        Promise.resolve(sent)
+          .then(function(){ setTimeout(cleanup, 300); })
+          .catch(function(){ setTimeout(cleanup, 300); });
+      } else {
+        // 兼容不支持 Promise 的情况
+        setTimeout(cleanup, 500);
+      }
     }
+
     currentRoomId = null;
     isHost = false;
     roomPlayers = {};
