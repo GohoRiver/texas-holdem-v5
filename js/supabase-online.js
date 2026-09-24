@@ -19,12 +19,12 @@ window.PokerOnline = (function(){
   let onRoomsUpdate = null;
   let heartbeatTimer = null;
 
-  /* ====== 大厅房间发现 ====== */
+  /* ===== 新增：大厅房间发现（不影响主流程） ===== */
   let lobbyChannel = null;
-  let lobbyRooms = {};         // roomId -> room info
-  let hostRoomInfo = null;     // 房主自己的房间信息
+  let lobbyRooms = {};
+  let hostRoomInfo = null;
   let hostAnnounceTimer = null;
-  const ROOM_TIMEOUT_MS = 15000; // 房间心跳超时（ms）
+  const ROOM_TTL_MS = 15000;
 
   function init(){
     if(!window.supabase){
@@ -35,7 +35,9 @@ window.PokerOnline = (function(){
     nickname = PokerStorage.getNickname() || 'Player';
     console.log('[Supabase] initialized, myId:', myId);
 
-    initLobbyChannel();
+    // 单独 try，失败也不阻塞主流程
+    try { initLobbyChannel(); }
+    catch(e){ console.warn('[Supabase] lobby channel init failed', e); }
 
     return Promise.resolve();
   }
@@ -44,7 +46,7 @@ window.PokerOnline = (function(){
   function setPlayersCallback(cb){ onPlayersUpdate = cb; }
   function setRoomsCallback(cb){ onRoomsUpdate = cb; }
 
-  /* ====== 大厅频道：房间发现 ====== */
+  /* ===== 大厅频道：负责房间发现 ===== */
   function initLobbyChannel(){
     if(lobbyChannel) return;
     lobbyChannel = supabase.channel('lobby', {
@@ -54,7 +56,7 @@ window.PokerOnline = (function(){
     lobbyChannel.on('broadcast', { event: 'room_available' }, (payload) => {
       const p = payload && payload.payload;
       if(!p || !p.roomId) return;
-      lobbyRooms[p.roomId] = Object.assign({}, p, { lastSeen: Date.now() });
+      lobbyRooms[p.roomId] = Object.assign({}, p, { _ts: Date.now() });
       if(onRoomsUpdate) onRoomsUpdate(getKnownRooms());
     });
 
@@ -66,17 +68,19 @@ window.PokerOnline = (function(){
       }
     });
 
-    // 有人进入大厅时，房主响应一下
     lobbyChannel.on('broadcast', { event: 'room_list_request' }, () => {
       if(isHost && hostRoomInfo){
-        lobbyChannel.send({ type: 'broadcast', event: 'room_available', payload: hostRoomInfo });
+        try {
+          lobbyChannel.send({ type:'broadcast', event:'room_available', payload: hostRoomInfo });
+        } catch(e){}
       }
     });
 
     lobbyChannel.subscribe(function(status){
       if(status === 'SUBSCRIBED'){
-        // 一进来就请求一次房间列表
-        lobbyChannel.send({ type: 'broadcast', event: 'room_list_request', payload: {} });
+        try {
+          lobbyChannel.send({ type:'broadcast', event:'room_list_request', payload:{} });
+        } catch(e){}
       }
     });
   }
@@ -86,10 +90,7 @@ window.PokerOnline = (function(){
     const out = [];
     for(const rid in lobbyRooms){
       const r = lobbyRooms[rid];
-      if(now - (r.lastSeen || 0) > ROOM_TIMEOUT_MS){
-        delete lobbyRooms[rid];
-        continue;
-      }
+      if(now - (r._ts || 0) > ROOM_TTL_MS){ delete lobbyRooms[rid]; continue; }
       out.push(r);
     }
     return out;
@@ -98,22 +99,26 @@ window.PokerOnline = (function(){
   function announceRoom(){
     if(!lobbyChannel || !hostRoomInfo) return;
     hostRoomInfo.count = Object.keys(roomPlayers).length || 1;
-    lobbyChannel.send({ type: 'broadcast', event: 'room_available', payload: hostRoomInfo });
+    try {
+      lobbyChannel.send({ type:'broadcast', event:'room_available', payload: hostRoomInfo });
+    } catch(e){}
   }
 
-  function closeRoomAnnouncement(){
+  function stopAnnounce(){
     if(lobbyChannel && hostRoomInfo){
-      lobbyChannel.send({
-        type: 'broadcast',
-        event: 'room_closed',
-        payload: { roomId: hostRoomInfo.roomId }
-      });
+      try {
+        lobbyChannel.send({
+          type:'broadcast',
+          event:'room_closed',
+          payload: { roomId: hostRoomInfo.roomId }
+        });
+      } catch(e){}
     }
     hostRoomInfo = null;
     if(hostAnnounceTimer){ clearInterval(hostAnnounceTimer); hostAnnounceTimer = null; }
   }
 
-  /* ====== 创建房间（房主） ====== */
+  /* ====== 创建房间（房主） —— 逻辑跟原版完全一致，只在结尾加了大厅广播 ====== */
   function createRoom(roomId, info){
     isHost = true;
     currentRoomId = roomId;
@@ -169,7 +174,7 @@ window.PokerOnline = (function(){
       if(onMessage) onMessage({ type: 'player_action', ...payload.payload });
     });
 
-    /* 开始广播房间信息到大厅 */
+    // 记录本房间信息，用于向大厅广播
     hostRoomInfo = {
       roomId: roomId,
       level: info.level || 'nano',
@@ -185,10 +190,12 @@ window.PokerOnline = (function(){
           roomPlayers[myId] = { name: nickname, ready: false, seat: 0, isSelf: true };
           broadcastPlayerList();
           notifyPlayers();
-          // 立即广播一次，然后每 4 秒心跳
+
+          // 立即广播一次，之后每 4 秒心跳
           announceRoom();
           if(hostAnnounceTimer) clearInterval(hostAnnounceTimer);
           hostAnnounceTimer = setInterval(announceRoom, 4000);
+
           console.log('[Supabase] room created:', roomId);
           resolve();
         }
@@ -196,7 +203,7 @@ window.PokerOnline = (function(){
     });
   }
 
-  /* ====== 加入房间（客户端） ====== */
+  /* ====== 加入房间（客户端） —— 逻辑跟原版完全一致 ====== */
   function joinRoom(roomId){
     isHost = false;
     currentRoomId = roomId;
@@ -309,10 +316,7 @@ window.PokerOnline = (function(){
 
   function leaveRoom(){
     if(heartbeatTimer){ clearInterval(heartbeatTimer); heartbeatTimer = null; }
-
-    // 先通知大厅：房间关了
-    if(isHost) closeRoomAnnouncement();
-
+    if(isHost) stopAnnounce();  // 只有房主需要向大厅宣布关闭
     if(channel){
       send('leave', { peerId: myId });
       supabase.removeChannel(channel);
@@ -340,7 +344,6 @@ window.PokerOnline = (function(){
     getRoomId: function(){ return currentRoomId; },
     getRoomPlayers: function(){ return roomPlayers; },
     getKnownRooms: getKnownRooms,
-    announceRoom: announceRoom,
     isHost: function(){ return isHost; }
   };
 })();
