@@ -39,6 +39,30 @@ const ONLINE_MAX_SEATS = 7;
 const ONLINE_MIN_SEATS = 2;
 const CHIP_TO_BEM = 0.0001;
 
+/* ★ A. 全局牌对象缓存：把"rank+suit 相同"的牌统一成同一个 JS 对象引用，
+     这样 _renderedCards（WeakSet）就能正确识别，不再每次触发入场动画（频闪根因）。
+     只在客户端 applyFullState 里用到，不影响联机协议。 */
+const _cardCache = new Map();
+function normalizeCard(c){
+  if(!c || !c.rank || !c.suit) return c;
+  const key = c.suit + c.rank;
+  let card = _cardCache.get(key);
+  if(card) return card;
+  card = {
+    rank: c.rank,
+    suit: c.suit,
+    value: c.value,
+    display: c.display || (c.rank + ' ' + c.suit),
+    red: !!c.red
+  };
+  _cardCache.set(key, card);
+  return card;
+}
+function normalizeCards(arr){
+  if(!arr || !arr.length) return [];
+  return arr.map(normalizeCard);
+}
+
 function $(id){ return document.getElementById(id); }
 function t(k,v){ return window.PokerI18n.t(k,v); }
 function sleep(ms){ return new Promise(r => setTimeout(r, ms)); }
@@ -160,20 +184,40 @@ function renderLobby(){
   renderTableGrid("aiTableGrid", "ai");
   renderTableGrid("pointsTableGrid", "points");
   renderTableGrid("realTableGrid", "real");
-  /* ★1 新增：渲染房间列表 */
+  /* ★ B. 渲染房间列表（大厅显示别人创建的房间 + 计数 badge） */
   renderRoomLists();
   refreshBalanceUI();
 }
 
-/* ★2 新增：房间列表渲染（大厅里显示别人创建的房间） */
+/* ★ B. 房间列表渲染 */
 function renderRoomLists(){
   if(!window.PokerOnline || !PokerOnline.getKnownRooms) return;
   const currentId = PokerOnline.getRoomId();
   const rooms = PokerOnline.getKnownRooms().filter(function(r){
     return r.roomId !== currentId;
   });
-  fillRoomList('pointsRoomList', rooms.filter(function(r){ return r.mode === 'points'; }));
-  fillRoomList('realRoomList',   rooms.filter(function(r){ return r.mode === 'real'; }));
+  const pointsRooms = rooms.filter(function(r){ return r.mode === 'points'; });
+  const realRooms   = rooms.filter(function(r){ return r.mode === 'real'; });
+
+  fillRoomList('pointsRoomList', pointsRooms);
+  fillRoomList('realRoomList',   realRooms);
+
+  updateRoomCount('pointsRoomCount', pointsRooms.length);
+  updateRoomCount('realRoomCount',   realRooms.length);
+
+  // 顶栏 statusLabel 显示总房间数
+  const total = pointsRooms.length + realRooms.length;
+  const sl = document.getElementById('statusLabel');
+  if(sl) sl.textContent = isEn() ? (total + (total === 1 ? ' table' : ' tables'))
+                                 : (total + ' 桌开放');
+}
+
+function updateRoomCount(id, n){
+  const el = document.getElementById(id);
+  if(!el) return;
+  el.innerHTML = '<span class="pulse"></span><span>' + n + (isEn() ? (n === 1 ? ' table' : ' tables') : ' 桌') + '</span>';
+  if(n > 0) el.classList.remove('zero');
+  else el.classList.add('zero');
 }
 
 function fillRoomList(containerId, rooms){
@@ -515,7 +559,6 @@ function hostStartGame(playerOrder, playersInfo){
   $("onlineLobby").classList.add("hidden");
   if($("gameWalletPill")) $("gameWalletPill").innerHTML = '<span class="dot" style="background:#a855f7;"></span><span>' + G.players.length + (isEn() ? " players" : " 人联机") + '</span>';
 
-  /* 广播 game_start */
   const startPayload = {
     playerOrder: playerOrder,
     players: G.players.map(function(p){
@@ -803,6 +846,11 @@ function applyFullState(state){
     if($("gameWalletPill")) $("gameWalletPill").innerHTML = '<span class="dot" style="background:#a855f7;"></span><span>' + G.players.length + (isEn() ? " players" : " 人联机") + '</span>';
   }
 
+  // 新手牌开始：清空渲染集合，让本手底牌正常播放入场动画
+  if(state.handNumber !== G.handNumber){
+    G._renderedCards = new WeakSet();
+  }
+
   state.players.forEach(function(sp, i){
     if(!G.players[i]) return;
     const p = G.players[i];
@@ -810,7 +858,9 @@ function applyFullState(state){
     p.folded = sp.folded;
     p.allIn = sp.allIn;
     p.currentBet = sp.currentBet;
-    p.holeCards = sp.holeCards || [];
+    /* ★ C. 用 normalizeCard 拿到缓存对象（同一张牌始终是同一个对象引用），
+         这样 _renderedCards（WeakSet）能正确识别「已渲染」，不再触发 cardIn 动画 → 消除频闪 */
+    p.holeCards = normalizeCards(sp.holeCards);
     p.lastAction = sp.lastAction;
     p.position = sp.position;
     p.positionKey = sp.positionKey;
@@ -826,7 +876,8 @@ function applyFullState(state){
   G.stage = state.stage;
   G.dealerIndex = state.dealerIndex;
   G.currentPlayerIndex = state.currentPlayerIndex;
-  G.community = state.community || [];
+  /* ★ C. 公共牌也用缓存对象 */
+  G.community = normalizeCards(state.community);
   G.handNumber = state.handNumber;
   G.smallBlind = state.smallBlind;
   G.bigBlind = state.bigBlind;
@@ -837,22 +888,26 @@ function applyFullState(state){
 
   render();
 
+  /* ★ D. 客户端轮到玩家时启动倒计时（用 handNumber:currentPlayerIndex 做 key，
+        广播刷新不会重置倒计时；只有真正换回合才重启） */
   if(G.currentPlayerIndex === G.online.mySeat && !G.gameOver && G.stage !== 'showdown'){
     const me = G.players[G.online.mySeat];
     if(me && !me.folded && !me.allIn){
       showHumanControls();
-      /* ★3 新增：客户端轮到自己时，也显示思考倒计时
-         —— 只在没有计时器时启动，避免房主 500ms 广播不断重置 */
-      if(!G.turnTimer) startTurnTimer(me);
+      const timerKey = G.handNumber + ':' + G.currentPlayerIndex + ':' + G.stage;
+      if(!G.turnTimer || G._timerKey !== timerKey){
+        G._timerKey = timerKey;
+        startTurnTimer(me);
+      }
     } else {
       const box = $("humanActions"); if(box) box.innerHTML = "";
       const panel = $("raisePanel"); if(panel) panel.classList.add("hidden");
-      stopTurnTimer();
+      if(G.turnTimer) stopTurnTimer();
     }
   } else {
     const box = $("humanActions"); if(box) box.innerHTML = "";
     const panel = $("raisePanel"); if(panel) panel.classList.add("hidden");
-    stopTurnTimer();
+    if(G.turnTimer) stopTurnTimer();
   }
 }
 
@@ -1376,6 +1431,8 @@ function backToLobby(){
   $("raisePanel").classList.add("hidden");
   $("handCardsLarge").innerHTML = "";
   showScreen("lobby");
+  /* 回大厅后刷新一次房间列表 */
+  renderRoomLists();
 }
 
 /* ========== 渲染 ========== */
@@ -1642,9 +1699,11 @@ function doHumanAction(action){
   }
 }
 
+/* startTurnTimer 里去掉顶部的 stopTurnTimer（避免每次广播都重置倒计时），
+   由调用方保证只在真正换回合时调用一次 */
 function startTurnTimer(player){
-  stopTurnTimer();
   if(!player || !player.isHuman) return;
+  if(G.turnTimer) return;  // 已在跑就别重启
   G.turnTimeLeft = 30;
   updateTimerUI();
   const tt = $("turnTimer"); if(tt) tt.classList.remove("hidden");
@@ -1664,6 +1723,7 @@ function startTurnTimer(player){
 }
 function stopTurnTimer(){
   if(G.turnTimer){ clearInterval(G.turnTimer); G.turnTimer = null; }
+  G._timerKey = null;
   const tt = $("turnTimer"); if(tt) tt.classList.add("hidden");
 }
 function updateTimerUI(){
@@ -1714,8 +1774,7 @@ document.addEventListener("DOMContentLoaded", function(){
         $("realSection").classList.remove("hidden");
         if(window.PokerWallet) PokerWallet.updateUI();
       }
-      /* ★4 新增：切到积分/链上 tab 时，房间列表也跟着刷新一遍 */
-      renderRoomLists();
+      renderRoomLists();  // 切 tab 时刷新房间列表
     });
   });
 
@@ -1734,7 +1793,7 @@ document.addEventListener("DOMContentLoaded", function(){
       PokerOnline.setPlayersCallback(function(){
         updateOnlineLobbyUI();
       });
-      /* ★5 新增：大厅房间列表回调 */
+      /* ★ E. 房间列表回调 */
       PokerOnline.setRoomsCallback(function(){
         renderRoomLists();
       });
@@ -1841,4 +1900,5 @@ document.addEventListener("DOMContentLoaded", function(){
     if(b) applyRaisePreset(b.getAttribute('data-preset'));
   });
 });
+
 })();
