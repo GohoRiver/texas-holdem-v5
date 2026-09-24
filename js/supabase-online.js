@@ -26,6 +26,7 @@ window.PokerOnline = (function(){
   let hostAnnounceTimer = null;
   const ROOM_TTL_MS = 8000;
   const ANNOUNCE_MS = 2000;
+  const MAX_SEATS = 7;
 
   function init(){
     if(!window.supabase){
@@ -118,7 +119,19 @@ window.PokerOnline = (function(){
     if(hostAnnounceTimer){ clearInterval(hostAnnounceTimer); hostAnnounceTimer = null; }
   }
 
-  /* ====== 创建房间（房主）====== */
+  /* ★ 空位复用：返回最小的未被占用的座位号 */
+  function nextFreeSeat(){
+    const used = {};
+    Object.keys(roomPlayers).forEach(function(pid){
+      used[roomPlayers[pid].seat] = true;
+    });
+    for(let i = 0; i < MAX_SEATS; i++){
+      if(!used[i]) return i;
+    }
+    return Object.keys(roomPlayers).length;
+  }
+
+  /* ====== 创建房间（房主） ====== */
   function createRoom(roomId, info){
     isHost = true;
     currentRoomId = roomId;
@@ -135,7 +148,7 @@ window.PokerOnline = (function(){
         roomPlayers[p.peerId] = {
           name: p.name,
           ready: false,
-          seat: Object.keys(roomPlayers).length,
+          seat: nextFreeSeat(),   // ★ 复用空位
           isSelf: false
         };
         broadcastPlayerList();
@@ -155,6 +168,7 @@ window.PokerOnline = (function(){
       tryStartGame();
     });
 
+    /* ★ 有人离桌：先更新 roomPlayers，广播玩家列表，再通知游戏引擎 */
     channel.on('broadcast', { event: 'leave' }, (payload) => {
       if(!isHost) return;
       const p = payload.payload;
@@ -163,6 +177,10 @@ window.PokerOnline = (function(){
         broadcastPlayerList();
         notifyPlayers();
         announceRoom();
+        // 通知所有客户端：有人离开（客人用来显示提示）
+        send('player_leave', { peerId: p.peerId });
+        // 通知游戏引擎：如果局内有人，标记 seated=false
+        if(onMessage) onMessage({ type: 'player_leave', peerId: p.peerId });
       }
     });
 
@@ -182,7 +200,7 @@ window.PokerOnline = (function(){
       mode: info.mode || 'points',
       hostName: nickname,
       count: 1,
-      maxSeats: 7
+      maxSeats: MAX_SEATS
     };
 
     return new Promise(function(resolve){
@@ -203,8 +221,7 @@ window.PokerOnline = (function(){
     });
   }
 
-  /* ====== 加入房间（客户端）====== */
-  /* ★ 关键改动：心跳从 1.5s 全量同步 → 12s 低频保活；不再 5 次连发 player_join */
+  /* ====== 加入房间（客户端） ====== */
   function joinRoom(roomId){
     isHost = false;
     currentRoomId = roomId;
@@ -230,9 +247,20 @@ window.PokerOnline = (function(){
       notifyPlayers();
     });
 
+    /* ★ 客户端收到 leave 后，本地也删一遍，不用等房主 list */
     channel.on('broadcast', { event: 'leave' }, (payload) => {
       const p = payload.payload;
       if(roomPlayers[p.peerId]){ delete roomPlayers[p.peerId]; notifyPlayers(); }
+    });
+
+    /* ★ 转发 player_leave 给 game.js */
+    channel.on('broadcast', { event: 'player_leave' }, (payload) => {
+      if(onMessage) onMessage({ type: 'player_leave', peerId: payload.payload.peerId });
+    });
+
+    /* ★ 房主离开 */
+    channel.on('broadcast', { event: 'host_left' }, () => {
+      if(onMessage) onMessage({ type: 'host_left' });
     });
 
     channel.on('broadcast', { event: 'game_start' }, (payload) => {
@@ -246,13 +274,11 @@ window.PokerOnline = (function(){
     return new Promise(function(resolve){
       channel.subscribe(function(status){
         if(status === 'SUBSCRIBED'){
-          // 只发 3 次 player_join（覆盖短暂网络抖动即可），不要连发 5 次
           for(let i = 0; i < 3; i++){
             setTimeout(function(){
               send('player_join', { peerId: myId, name: nickname });
             }, i * 300);
           }
-          // 12s 保活，只是兜底；房主会在行动/进街/摊牌时主动广播
           heartbeatTimer = setInterval(function(){
             if(!channel) return;
             send('sync_request', { peerId: myId });
@@ -284,7 +310,10 @@ window.PokerOnline = (function(){
     if(ids.length < 2) return;
     const allReady = ids.every(function(pid){ return roomPlayers[pid].ready; });
     if(!allReady) return;
-    const order = ids.slice().sort();
+    /* 按 seat 排序，座位顺序稳定 */
+    const order = ids.slice().sort(function(a, b){
+      return (roomPlayers[a].seat || 0) - (roomPlayers[b].seat || 0);
+    });
     if(onMessage) onMessage({
       type: 'host_start_game',
       playerOrder: order,
@@ -296,7 +325,8 @@ window.PokerOnline = (function(){
 
   function send(event, payload){
     if(!channel) return;
-    channel.send({ type: 'broadcast', event: event, payload: payload });
+    try { channel.send({ type: 'broadcast', event: event, payload: payload }); }
+    catch(e){}
   }
 
   function sendFullState(state){ send('full_state', state); }
@@ -308,6 +338,11 @@ window.PokerOnline = (function(){
     send('game_start', payload);
   }
 
+  /* ★ 房主离桌通知 */
+  function sendHostLeft(){
+    send('host_left', { peerId: myId });
+  }
+
   function toggleReady(){
     const me = roomPlayers[myId];
     if(!me) return false;
@@ -317,13 +352,20 @@ window.PokerOnline = (function(){
     return me.ready;
   }
 
+  /* ★ 先 send 再延迟 removeChannel，确保 leave 消息发得出去 */
   function leaveRoom(){
     if(heartbeatTimer){ clearInterval(heartbeatTimer); heartbeatTimer = null; }
     if(isHost) stopAnnounce();
-    if(channel){
-      send('leave', { peerId: myId });
-      supabase.removeChannel(channel);
-      channel = null;
+
+    const ch = channel;
+    channel = null;
+    if(ch){
+      try {
+        ch.send({ type: 'broadcast', event: 'leave', payload: { peerId: myId } });
+      } catch(e){}
+      setTimeout(function(){
+        try { supabase.removeChannel(ch); } catch(e){}
+      }, 250);
     }
     currentRoomId = null;
     isHost = false;
@@ -339,6 +381,7 @@ window.PokerOnline = (function(){
     sendFullState: sendFullState,
     sendPlayerAction: sendPlayerAction,
     sendGameStart: sendGameStart,
+    sendHostLeft: sendHostLeft,
     setMessageCallback: setMessageCallback,
     setPlayersCallback: setPlayersCallback,
     setRoomsCallback: setRoomsCallback,
